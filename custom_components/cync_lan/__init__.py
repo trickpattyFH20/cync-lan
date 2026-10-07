@@ -12,6 +12,17 @@ HTTP server entirely.
 
 from __future__ import annotations
 
+# --- deploy branch: run the bundled cync_lan (see _vendor/README.md) ---------
+# Must stay above every other import: nothing may import cync_lan before
+# _vendor is first on sys.path.
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_VENDOR_DIR = _Path(__file__).resolve().parent / "_vendor"
+if str(_VENDOR_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_VENDOR_DIR))
+# --- end deploy branch --------------------------------------------------------
+
 import asyncio
 import contextlib
 import logging
@@ -138,6 +149,24 @@ class CyncLanRuntimeData:
     created_switch_group_ids: Optional[set[int]] = None  # group_ids already added
 
 
+def _check_bundled_library() -> bool:
+    """Deploy branch: log which cync_lan is running, and warn loudly when it
+    is not the bundled copy (something imported a PyPI install first)."""
+    import cync_lan
+
+    path = _Path(cync_lan.__file__).resolve()
+    if path.is_relative_to(_VENDOR_DIR):
+        _LOGGER.info("Using bundled cync_lan %s from %s", cync_lan.__version__, path.parent)
+        return True
+    _LOGGER.warning(
+        "cync_lan %s loaded from %s, not the bundled copy in %s; restart Home Assistant",
+        cync_lan.__version__,
+        path.parent,
+        _VENDOR_DIR,
+    )
+    return False
+
+
 def _import_cync_lan_symbols() -> tuple[
     str,
     type["nCyncServer"],
@@ -167,6 +196,7 @@ def _import_cync_lan_symbols() -> tuple[
     from cync_lan.structs import GlobalObject
     from cync_lan.utils import parse_config, parse_groups, parse_schedules, parse_scenes
 
+    _check_bundled_library()
     return (
         CYNC_CONFIG_FILE_PATH,
         nCyncServer,

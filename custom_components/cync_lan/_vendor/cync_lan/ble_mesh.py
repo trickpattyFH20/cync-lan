@@ -1,0 +1,939 @@
+"""Telink BLE mesh transport - controlling already-provisioned devices.
+
+The sibling of `ble_provision`, which handles getting a factory-default device
+*onto* a mesh. This one talks to devices already on one, and is the second
+transport for the same protocol `server.py` speaks over TCP.
+
+CONFIRMED ON HARDWARE (2026-07-28)
+----------------------------------
+Not a translation of somebody else's code taken on faith. Against a wired Cync
+switch, via `research`'s `probes/ble_control_probe.py`:
+
+- the session handshake completed with `verify_pairing_response` reporting
+  mutual auth verified - the device proved it derived the same key material;
+- inbound traffic decrypted into sensible plaintext, with the vendor ID at
+  bytes 8:9 exactly where the framing predicts and readable ASCII after it;
+- a `set_power` built by this module's layout **changed the switch's state**,
+  and cync-lan reported that change over its own TCP connection.
+
+That last point is what makes it evidence rather than a hopeful reading: the
+command left over Bluetooth and the confirmation arrived over TCP, so two
+independent transports corroborate each other.
+
+**Mesh relay is confirmed too.** A command addressed to one device, sent over
+a connection to a *different* device, is relayed and acted on. So a consumer
+needs ONE BLE connection to reach the whole mesh - not a connection per
+device, which at ~40 nodes would be unworkable.
+
+WHAT IS NOT CONFIRMED
+---------------------
+`set_power` (`0xD0`) and `set_brightness` (both the `0xF0` and `0xD2` forms) are
+confirmed. Colour temperature and RGB are not - they ride the same `0xF0`
+family whose brightness member works, so they are better founded than a guess,
+but nobody has moved either over this transport.
+
+A surprise came out of testing brightness, and it is recorded rather than
+tidied away. **Both** forms changed the brightness of the same wired dimmer:
+`0xF0` with the six-byte payload, and `0xD2` with a bare brightness byte -
+even though `docs/mesh_opcodes.md` treats `0xD2` as the sol-lamp variant and
+`devices.py` only ever sends it to sol lamps over TCP.
+
+Accepted is not the same as equivalent, so the `is_sol_lamp` branch stays and
+the default remains whichever form `devices.py` sends for that device class.
+The verification channel here is cync-lan's own reporting, which surfaces the
+brightness level and little else - it would not reveal a difference in fade
+behaviour, in what the device persists across a power cycle, or in sub-percent
+handling (`set_fine_brightness` extends the `0xE2` family precisely because the
+basic form cannot express it). Sending a device the command its own class is
+documented to use costs nothing and forecloses a whole category of side effect
+nobody has looked for.
+
+INBOUND STATUS: RECEIVABLE, BUT NOT YET COMPATIBLE WITH SENDING
+---------------------------------------------------------------
+This has now been wrong in both directions, so the current state is set out
+carefully.
+
+Status packets *can* be received and decrypted - 20 of them, in one run, with
+`0xDC` and the vendor ID landing exactly where the framing predicts. So the
+claim that this firmware "refuses notifications" was wrong.
+
+But BlueZ's `StartNotify` is refused (GATT `Unlikely Error`) **and the rejection
+takes the connection down with it** - confirmed, because the next control write
+fails with 'Not connected'. A revision of this module then wrongly called that
+survivable, misled by the notifications that arrive *before* the rejection:
+those come from BlueZ subscribing locally while the device is already reporting
+from the `0x01` enable-write, and they say nothing about the link lasting.
+
+So today there is a choice, not a solution:
+
+- **send reliably**: never call `subscribe()`. Confirmed working - power and
+  brightness both landed on runs that never attempted a subscription.
+- **receive**: call `subscribe()` and accept that the session ends.
+
+`google/python-dimond` has neither problem, because bluepy never writes a CCCD
+at all - it registers a delegate and waits. The open question is whether BlueZ
+can be made to deliver notifications without its own CCCD write. Two candidates
+are untested: writing the descriptor by hand, and relying on the enable-write
+alone. Until one of them works, a consumer needing both directions has to
+reconnect between them.
+
+WHY THIS MODULE NEVER IMPORTS BLEAK
+-----------------------------------
+It takes a client rather than creating one. That is the single most important
+decision here.
+
+A Home Assistant integration must be able to hand in a connection from HA's
+own Bluetooth stack, which is what makes ESPHome Bluetooth proxies work. Had
+this module constructed a `BleakClient` itself, proxies would be impossible
+and the transport would only ever reach devices in radio range of the machine
+running it - useless for a mesh spread across a house.
+
+So the dependency is structural (`GattClient` below), satisfied by
+`bleak.BleakClient` and by HA's client alike, and `bleak` stays an optional
+extra rather than a hard requirement.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
+
+from .ble_provision import (
+    _aes_ecb_encrypt,
+    _pad16,
+    derive_session_key,
+    key_encrypt,
+    verify_pairing_response,
+)
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "CONTROL_CHAR",
+    "NOTIFICATION_CHAR",
+    "PAIRING_CHAR",
+    "VENDOR_ID",
+    "BleMeshError",
+    "BleMeshSession",
+    "DeviceStatus",
+    "GattClient",
+    "OP_SET_LEVEL",
+    "build_command",
+    "decrypt_packet",
+    "encrypt_packet",
+    "mac_to_address",
+    "mesh_credentials_from_home",
+]
+
+# Telink mesh GATT characteristics. Confirmed present on real hardware, with
+# 1911 read/write/notify, 1912 read/write/write-without-response, 1914
+# read/write.
+NOTIFICATION_CHAR = "00010203-0405-0607-0809-0a0b0c0d1911"
+CONTROL_CHAR = "00010203-0405-0607-0809-0a0b0c0d1912"
+PAIRING_CHAR = "00010203-0405-0607-0809-0a0b0c0d1914"
+
+# The Telink vendor ID. This is the `0x11, 0x02` that opens every payload in
+# docs/mesh_opcodes.md - the TCP transport embeds it at the head of the
+# payload, while BLE gives it a field of its own. Same command, different
+# framing, which is why the opcode table is shared between the two.
+VENDOR_ID = 0x0211
+
+OP_SET_POWER = 0xD0
+# 0xF0 carries brightness, temperature and RGB for ordinary devices; 0xD2/0xE2
+# are the sol-lamp variants of the first two. Mirrors devices.py's own
+# `op = 0xD2 if self.is_sol_lamp else 0xF0` rather than reimplementing the rule.
+OP_SET_LEVEL = 0xF0
+OP_SET_BRIGHTNESS_SOL = 0xD2
+OP_SET_TEMP_SOL = 0xE2
+OP_STATUS_NOTIFY = 0xDC
+
+# Aliases kept because acync names these as *the* brightness and temperature
+# opcodes, and this module followed it at first. They are the sol-lamp forms.
+#
+# Do not assume they are inert on other hardware: 0xD2 was tested on a wired
+# dimmer and DID change its brightness, which docs/mesh_opcodes.md's sol-lamp
+# framing does not predict. See set_brightness for why the branch is kept
+# anyway.
+OP_SET_BRIGHTNESS = OP_SET_BRIGHTNESS_SOL
+OP_SET_TEMP_RGB = OP_SET_TEMP_SOL
+
+# Hands a Wi-Fi-capable device its network credentials, over the same
+# encrypted mesh-command path as everything else - no cleartext ever goes on
+# air. `SetWifiCommand.java`'s opcode array is {0xF6, 0x11, 0x02, 0x02}: the
+# opcode, the vendor id, and a sub-discriminator that rides in the payload.
+# The 0x8E family, on the wire it was always meant for.
+#
+# Over TCP these ride a "mesh relay" envelope (op 0x8E, repeat_op_code=False)
+# whose whole job is to get the Wi-Fi device to forward them into this mesh.
+# Here we are already on the mesh, so the envelope disappears and what is
+# left is the command itself - which is why the decompiled app's opcode
+# arrays read as BLE packets directly.
+#
+# `SetStatusIndicatorSettingsCommand`'s array is {0xF7, 0x11, 0x02, 0x06}:
+# opcode, vendor id low, vendor id high, sub-command. Those are exactly
+# build_command's bytes 7, 8, 9 and the first data byte. devices.py builds
+# the same four bytes as the head of a TCP payload; the difference is only
+# where the vendor id sits.
+OP_VENDOR_SETTINGS = 0xF7
+
+# Sub-commands within 0xF7, taken from the payloads devices.py sends.
+SUB_INDICATOR_LED = 0x06
+SUB_MULTICOLOR = 0x4E
+SUB_DIMMER_LED_MODE = 0x62
+SUB_DIMMER_LED_LEVEL = 0x63
+
+# The dimmer LED level bar is a preview/save pair, not one write - the
+# device shows the level while you drag and keeps it when you let go.
+DIMMER_LED_ACTION_PREVIEW = 1
+DIMMER_LED_ACTION_SAVE = 2
+
+# How the level bar behaves. devices.py refuses anything else and so does
+# this - a mesh command is fire-and-forget with no ack, so an out-of-range
+# mode is invisible unless it is refused before it goes out.
+DIMMER_LED_BRIEFLY_DISPLAY = 1
+DIMMER_LED_ALWAYS_ON = 2
+
+OP_SET_WIFI = 0xF6
+_WIFI_SUBCODE = 0x02
+_WIFI_CHUNK_LEN = 8
+
+# `TelinkBleDeviceController.m14192x` resolves a null target to
+# `MeshAddress.c(deviceId.index)`, and a freshly discovered device's index is
+# 0 - the SELF_ADDRESS sentinel (`MeshAddress.java:110`). Numerically the same
+# as the broadcast address build_command warns about, and safe here for the
+# reason that warning does not cover: an unprovisioned device is the only one
+# on the link, so "everyone" and "you" are the same set.
+SELF_ADDRESS = 0
+
+_PAIRING_OPCODE = 0x0C
+_PACKET_LEN = 20
+_MAX_COUNTER = 0xFFFF
+
+
+class BleMeshError(Exception):
+    """Raised when a mesh session cannot be established or used."""
+
+
+@runtime_checkable
+class GattClient(Protocol):
+    """The slice of a GATT client this module needs.
+
+    Structural rather than nominal on purpose - see the module docstring.
+    `bleak.BleakClient` satisfies it, and so does anything Home Assistant
+    hands over, without this module importing either.
+    """
+
+    @property
+    def is_connected(self) -> bool: ...
+
+    async def read_gatt_char(self, char_specifier: str, **kwargs: Any) -> bytearray: ...
+
+    async def write_gatt_char(
+        self, char_specifier: str, data: bytes, response: bool = False, **kwargs: Any
+    ) -> None: ...
+
+    async def start_notify(
+        self,
+        char_specifier: str,
+        callback: Callable[[Any, bytearray], Any],
+        **kwargs: Any,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class DeviceStatus:
+    """One device's state, as reported in a `0xDC` status notification."""
+
+    device_id: int
+    brightness: int
+    is_rgb: bool
+    colour_temp: int = 0
+    red: int = 0
+    green: int = 0
+    blue: int = 0
+    #: Whether the mesh could actually reach this device when it reported.
+    #: An offline device's brightness is the last thing the mesh knew, not a
+    #: fresh reading, so consumers should prefer their own last-known state
+    #: over overwriting it with a stale zero.
+    online: bool = True
+
+
+def mac_to_address(mac: str) -> bytes:
+    """MAC string to the reversed byte order the packet cipher expects.
+
+    Only the first four bytes are ever used, but all six are returned since
+    the inbound direction indexes three of them.
+    """
+    try:
+        return bytes(int(part, 16) for part in reversed(mac.split(":")))
+    except ValueError as exc:
+        raise BleMeshError(f"not a MAC address: {mac!r}") from exc
+
+
+def mesh_credentials_from_home(home: dict) -> tuple[str, str]:
+    """Pull the Telink mesh name and password out of an exported home.
+
+    These do NOT come from the hub. `cloud_api._parse_raw_export` already
+    writes them: the home's `mac` is the mesh name and its `access_key` is the
+    mesh password. Both confirmed on hardware - a handshake built from them
+    returned a verified mutual-auth proof.
+
+    Worth stating explicitly because the integration's `query_mesh_credentials`
+    button implies otherwise, and that button is a hub command - a family that
+    currently gets no reply at all (see docs/hub_envelope_ab_test.md). Nothing
+    here depends on it.
+    """
+    try:
+        return str(home["mac"]), str(home["access_key"])
+    except KeyError as exc:
+        raise BleMeshError(
+            f"exported home is missing {exc.args[0]!r}; expected both 'mac' and "
+            "'access_key' as written by cloud_api._parse_raw_export"
+        ) from exc
+
+
+def encrypt_packet(session_key: bytes, address: bytes, packet: bytearray) -> bytearray:
+    """Authenticate and encrypt one command packet, in place.
+
+    Bytes 3-4 become a two-byte MAC over the plaintext; bytes 5.. are then
+    XORed with a keystream block. Both halves derive from the session key and
+    the connected device's address, so a packet is only valid on the link it
+    was built for.
+    """
+    if len(packet) != _PACKET_LEN:
+        raise BleMeshError(f"packet must be {_PACKET_LEN} bytes, got {len(packet)}")
+
+    auth_nonce = (
+        bytes(address[:4]) + b"\x01" + bytes(packet[0:3]) + bytes([15]) + b"\x00" * 7
+    )
+    authenticator = bytearray(_aes_ecb_encrypt(session_key, _pad16(auth_nonce)))
+    for i in range(15):
+        authenticator[i] ^= packet[i + 5]
+
+    mac = _aes_ecb_encrypt(session_key, bytes(authenticator))
+    packet[3] = mac[0]
+    packet[4] = mac[1]
+
+    iv = b"\x00" + bytes(address[:4]) + b"\x01" + bytes(packet[0:3]) + b"\x00" * 7
+    keystream = _aes_ecb_encrypt(session_key, _pad16(iv))
+    for i in range(15):
+        packet[i + 5] ^= keystream[i]
+    return packet
+
+
+def decrypt_packet(session_key: bytes, address: bytes, packet: bytearray) -> bytearray:
+    """Decrypt an inbound notification, in place.
+
+    A different IV layout from the outbound direction, so this is not the
+    inverse of `encrypt_packet`. It is its own inverse, being an XOR keystream
+    - which the tests assert, because it is the property that actually holds
+    and the easy mistake is to assume the other one.
+    """
+    iv = bytes(address[:3]) + bytes(packet[0:5]) + b"\x00" * 8
+    keystream = _aes_ecb_encrypt(session_key, _pad16(b"\x00" + iv[:15]))
+    for i in range(len(packet) - 7):
+        packet[i + 7] ^= keystream[i]
+    return packet
+
+
+def build_command(
+    counter: int,
+    target: int,
+    opcode: int,
+    data: bytes,
+    *,
+    chunk_index: int = 0,
+) -> bytearray:
+    """Lay out one plaintext mesh command.
+
+    `target` is a mesh device id - `int(str(deviceID)[-3:])`, as
+    `cloud_api._parse_raw_export` computes it. **0 is the broadcast address**
+    and commands every device on the mesh at once; callers wanting one device
+    must not pass it by accident.
+
+    `chunk_index` fills byte 2, which is zero for every ordinary command.
+    `SetWifiCommand` is the one that uses it, to number the pieces of a
+    credential payload too long for a single packet. It is not merely
+    cosmetic: byte 2 is part of both the authentication nonce and the
+    keystream IV (see `encrypt_packet`), so each chunk encrypts under a
+    different keystream and the field has to be set before encryption.
+    """
+    if len(data) > _PACKET_LEN - 10:
+        raise BleMeshError(f"payload too long for one packet: {len(data)} bytes")
+
+    packet = bytearray(_PACKET_LEN)
+    packet[0] = counter & 0xFF
+    packet[1] = (counter >> 8) & 0xFF
+    packet[2] = chunk_index & 0xFF
+    packet[5] = target & 0xFF
+    packet[6] = (target >> 8) & 0xFF
+    packet[7] = opcode
+    # The vendor gets its own field here, unlike the TCP transport where the
+    # same two bytes lead the payload.
+    packet[8] = VENDOR_ID & 0xFF
+    packet[9] = (VENDOR_ID >> 8) & 0xFF
+    packet[10 : 10 + len(data)] = data
+    return packet
+
+
+def build_wifi_payload(ssid: str, password: str, device_type: int) -> bytes:
+    """The plaintext credential buffer, before it is cut into packets.
+
+    Layout from `Utilities.java:225-236`:
+
+        [total chunks (1B)]
+        [len(ssid) (1B)][ssid, UTF-8]
+        [len(password) (1B)][password, UTF-8]
+        [0x01]
+        [device type id (1B)]
+
+    The length the chunk count is computed from includes the count byte
+    itself, which is why the app's formula is
+    `ceil((len(ssid) + len(password) + 5) / 8)`.
+    """
+    ssid_bytes = ssid.encode("utf-8")
+    password_bytes = password.encode("utf-8")
+    if not 0 < len(ssid_bytes) < 256:
+        raise BleMeshError(f"ssid must be 1-255 UTF-8 bytes, got {len(ssid_bytes)}")
+    if len(password_bytes) > 255:
+        raise BleMeshError(
+            f"password must be at most 255 UTF-8 bytes, got {len(password_bytes)}"
+        )
+    if not 0 <= device_type <= 0xFF:
+        raise BleMeshError(f"device type must fit one byte, got {device_type}")
+
+    total = len(ssid_bytes) + len(password_bytes) + 5
+    chunks = -(-total // _WIFI_CHUNK_LEN)
+    if chunks > 0xFF:
+        raise BleMeshError("credentials are too long to chunk")
+    return (
+        bytes([chunks, len(ssid_bytes)])
+        + ssid_bytes
+        + bytes([len(password_bytes)])
+        + password_bytes
+        + bytes([0x01, device_type])
+    )
+
+
+def build_wifi_chunks(payload: bytes) -> list[bytes]:
+    """Cut a credential buffer into the per-packet pieces, 1-based.
+
+    Each returned item is the command payload for one packet: the WiFi
+    sub-discriminator, the chunk index repeated (the app writes it both in
+    byte 2 of the packet and again here), then up to eight payload bytes.
+    """
+    out: list[bytes] = []
+    for index, start in enumerate(range(0, len(payload), _WIFI_CHUNK_LEN), start=1):
+        out.append(
+            bytes([_WIFI_SUBCODE, index]) + payload[start : start + _WIFI_CHUNK_LEN]
+        )
+    return out
+
+
+def parse_status(plaintext: bytes) -> list[DeviceStatus]:
+    """Decode the device reports carried in a decrypted `0xDC` notification.
+
+    Two four-byte slots per packet, laid out `[address, online, level, extra]`.
+
+    **The field meanings are taken from the shipping app's own parser**, not
+    inferred: `MeshStatusNotification$TelinkParser` slices the payload from
+    offset 10 into two four-byte groups, and `MeshState.Companion` (decompiled
+    `product/MeshState.java`) decodes each one as:
+
+        address = slot[0]              parsed only when > 0
+        online  = slot[1] != 0         the flag behind MeshStateWithOnlineInfo
+        level   = slot[2]              bits 0-6 brightness, coerced to 0..100
+                                       bit 7 marks a full-colour device
+        extra   = slot[3]              run mode / packed RGB; 0xFF and 0x7F
+                                       are sentinels, not colour values
+
+    and derives power as `brightness != 0` - which is exactly the on/off test
+    consumers already use, now confirmed against the vendor implementation
+    rather than only against behaviour.
+
+    **Two earlier readings of `slot[1]` were both wrong, in opposite
+    directions.** acync skips a slot whose second byte is zero; a previous
+    revision here inverted that and skipped every slot whose second byte was
+    *non*-zero, on the strength of a single capture in which the `byte[1] == 0`
+    records happened to be the interesting ones. That inversion discards every
+    reachable device - on a 46-node mesh it keeps 6 slots and drops 38.
+
+    Neither rule is a presence test at all: `slot[1]` is the online flag and
+    `slot[0]` is what says whether the slot holds a device. A live sweep
+    settles it independently of the decompile - device 21 reported
+    `slot = [21, 183, 100, 0]` while the TCP transport, watching the same
+    device over a completely separate protocol, reported `pow=1 bri=100`.
+    Under the inverted rule that device is skipped outright.
+
+    The earlier hardware confirmation still stands and is unaffected:
+
+        set brightness 60  -> decoded 60
+        set brightness 25  -> decoded 25
+        set power off      -> decoded 0
+
+    Exact agreement at two distinct levels and a return to zero when switched
+    off, across a 38-device sweep.
+
+    One timing caveat for consumers: a harvest taken immediately after a
+    command can still report the *previous* value - observed once, with the
+    next harvest a few seconds later reporting correctly. State propagates
+    through the mesh at its own pace; do not read one stale sample as a failed
+    command.
+    """
+    if len(plaintext) < 18 or plaintext[7] != OP_STATUS_NOTIFY:
+        return []
+
+    out: list[DeviceStatus] = []
+    for offset in (10, 14):
+        slot = plaintext[offset : offset + 4]
+        # The address is what says whether the slot holds a device - the app
+        # parses a group only when slot[0] > 0. Address 0 is the broadcast
+        # sentinel and never a real reporter.
+        if len(slot) < 4 or slot[0] == 0:
+            continue
+        online = slot[1] != 0
+        level = slot[2]
+        # Bit 7 is the full-colour flag, bits 0-6 the level. Coerced because
+        # the app does: the wire can carry values above 100 and they are not
+        # meaningful as a percentage.
+        brightness = min(level & 0x7F, 100)
+        extra = slot[3]
+        if level & 0x80:
+            out.append(
+                DeviceStatus(
+                    device_id=slot[0],
+                    brightness=brightness,
+                    is_rgb=True,
+                    red=int(((extra & 0xE0) >> 5) * 255 / 7),
+                    green=int(((extra & 0x1C) >> 2) * 255 / 7),
+                    blue=int((extra & 0x03) * 255 / 3),
+                    online=online,
+                )
+            )
+        else:
+            # 0xFF and 0x7F are the app's sentinels in this byte, not colour
+            # temperatures - it routes both away from its run-mode decode. A
+            # CCT device cannot be at temperature 255, so reporting one would
+            # be inventing a reading; report no colour information instead.
+            # (The app's fallback synthesises an RGB value from the sentinel;
+            # that is not reproduced here, because claiming a colour for a
+            # device that reported none is the same invention in another form.)
+            out.append(
+                DeviceStatus(
+                    device_id=slot[0],
+                    brightness=brightness,
+                    is_rgb=False,
+                    colour_temp=0 if extra in (0xFF, 0x7F) else extra,
+                    online=online,
+                )
+            )
+    return out
+
+
+class BleMeshSession:
+    """An authenticated session with one mesh node.
+
+    Because commands are relayed, a single session reaches the whole mesh -
+    confirmed on hardware. Consumers should hold one of these, not one per
+    device.
+
+    The client is supplied, never created: see the module docstring for why
+    that is what makes Bluetooth proxies possible.
+    """
+
+    def __init__(
+        self,
+        client: GattClient,
+        mac: str,
+        mesh_name: str,
+        mesh_password: str,
+    ) -> None:
+        self._client = client
+        self._mac = mac
+        self._address = mac_to_address(mac)
+        self._mesh_name = mesh_name
+        self._mesh_password = mesh_password
+        self._session_key: Optional[bytes] = None
+        self._counter = 1
+        self._notify_active = False
+
+    @property
+    def authenticated(self) -> bool:
+        return self._session_key is not None and self._client.is_connected
+
+    @property
+    def notifications_active(self) -> bool:
+        """False on firmware that refuses the CCCD write - not an error."""
+        return self._notify_active
+
+    async def authenticate(self, r_app: Optional[bytes] = None) -> bool:
+        """Perform the pairing handshake and derive the session key.
+
+        `r_app` is the client's random contribution; a fresh one is generated
+        per session unless supplied (tests supply it). Note this deliberately
+        does not reuse `ble_provision.build_pairing_write`, which pins a fixed
+        R_APP constant in order to reproduce the app's factory-default write
+        byte for byte - correct there, wrong for a live session.
+
+        Returns whether the device's proof verified. A False return is worth
+        surfacing loudly: it means the mesh name or password is wrong, and
+        every subsequent write will be ignored or the link dropped.
+        """
+        if r_app is None:
+            import os
+
+            r_app = os.urandom(8)
+
+        proof = key_encrypt(
+            self._mesh_name.encode("utf-8"),
+            self._mesh_password.encode("utf-8"),
+            _pad16(r_app),
+        )[:8]
+        await self._client.write_gatt_char(
+            PAIRING_CHAR, bytes([_PAIRING_OPCODE]) + r_app + proof, response=True
+        )
+        response = bytes(await self._client.read_gatt_char(PAIRING_CHAR))
+
+        if len(response) < 9:
+            raise BleMeshError(
+                f"pairing response too short ({len(response)} bytes) - the device "
+                "did not accept the write"
+            )
+
+        self._session_key = derive_session_key(
+            self._mesh_name, self._mesh_password, r_app, response[1:9]
+        )
+
+        # Deriving a key always succeeds, whatever password it is given. This
+        # is the only thing that says the DEVICE agreed.
+        verified = verify_pairing_response(
+            self._mesh_name, self._mesh_password, response
+        )
+        if not verified:
+            logger.warning(
+                "%s: mesh mutual auth failed - the device's proof does not match. "
+                "The mesh name should be the home's 'mac' and the password its "
+                "'access_key'. Commands will very likely be ignored.",
+                self._mac,
+            )
+        return verified
+
+    async def subscribe(
+        self, callback: Callable[[list[DeviceStatus]], Awaitable[None] | None]
+    ) -> bool:
+        """Try to receive status notifications. Optional, and often refused.
+
+        At least one firmware declares `notify` on the characteristic, rejects
+        the CCCD write with GATT `Unlikely Error`, and then drops the
+        connection. So failure is reported, not raised, and a consumer that
+        only sends never needs to call this at all.
+        """
+        if self._session_key is None:
+            raise BleMeshError("authenticate() first")
+
+        def _on_notify(_sender: Any, data: bytearray) -> None:
+            assert self._session_key is not None
+            plaintext = decrypt_packet(
+                self._session_key, self._address, bytearray(data)
+            )
+            statuses = parse_status(bytes(plaintext))
+            if statuses:
+                result = callback(statuses)
+                if hasattr(result, "__await__"):
+                    import asyncio
+
+                    asyncio.get_running_loop().create_task(result)  # type: ignore[arg-type]
+
+        # Order matters, and it is the opposite of the obvious one.
+        #
+        # Writing 0x01 to the notification characteristic's VALUE is the
+        # vendor's own start-reporting command - google/python-dimond does
+        # exactly this and never writes a CCCD at all. Notifications then flow.
+        # BlueZ's StartNotify additionally writes the CCCD (0x2902, which this
+        # hardware does expose, at handle 19) and the device answers that with
+        # GATT 'Unlikely Error'.
+        #
+        # So the enable-write goes first and its failure is what matters. The
+        # subscribe is attempted afterwards because bleak needs it to route
+        # notifications to a callback, but a rejection there is survivable:
+        # confirmed on hardware, 16 status packets arrived and decrypted
+        # correctly on a connection whose StartNotify had been refused.
+        try:
+            await self._client.write_gatt_char(
+                NOTIFICATION_CHAR, bytes([0x01]), response=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "%s: could not enable status reporting (%s). Sending is unaffected.",
+                self._mac,
+                exc,
+            )
+            return False
+
+        try:
+            await self._client.start_notify(NOTIFICATION_CHAR, _on_notify)
+        except Exception as exc:  # noqa: BLE001
+            # A refused StartNotify is NOT survivable, and an earlier revision of
+            # this method wrongly said it was. Confirmed on hardware: the very
+            # next control write fails with 'Not connected'. The rejection does
+            # not merely fail - it takes the link down with it.
+            #
+            # The notifications that appear before the rejection are what misled
+            # the earlier version. They arrive because BlueZ subscribes locally
+            # and the device is already reporting from the 0x01 write; they say
+            # nothing about the connection surviving.
+            self._notify_active = False
+            logger.warning(
+                "%s: StartNotify was refused (%s) and this firmware drops the "
+                "connection when that happens. The session is no longer usable. "
+                "To send commands reliably, do not call subscribe() at all.",
+                self._mac,
+                exc,
+            )
+            raise BleMeshError(
+                "StartNotify was refused and the link is now down; reconnect and "
+                "do not subscribe if you only need to send"
+            ) from exc
+
+        self._notify_active = True
+        return True
+
+    async def send(
+        self, target: int, opcode: int, data: bytes, *, chunk_index: int = 0
+    ) -> None:
+        """Encrypt and write one command.
+
+        Fire and forget - the control characteristic is written without a
+        response, and this transport has no acknowledgement. Confirm state
+        some other way; the TCP path's own reporting is one option, and is how
+        this module was verified in the first place.
+        """
+        if self._session_key is None:
+            raise BleMeshError("authenticate() first")
+        if not self._client.is_connected:
+            raise BleMeshError("link is down")
+
+        packet = build_command(
+            self._counter, target, opcode, data, chunk_index=chunk_index
+        )
+        self._counter = 1 if self._counter >= _MAX_COUNTER else self._counter + 1
+        encrypted = encrypt_packet(self._session_key, self._address, packet)
+        await self._client.write_gatt_char(
+            CONTROL_CHAR, bytes(encrypted), response=False
+        )
+
+    async def set_wifi_credentials(
+        self,
+        ssid: str,
+        password: str,
+        device_type: int,
+        *,
+        target: int = SELF_ADDRESS,
+    ) -> int:
+        """Hand a Wi-Fi-capable device its network credentials.
+
+        The last step of commissioning, and the one piece of this protocol
+        with no prior art anywhere - it is Cync/GE-specific, layered on the
+        generic Telink base. Everything about the transport is ordinary
+        though: N fully-encrypted mesh commands sent in sequence, not one long
+        GATT write and not a special unencrypted framing. **No cleartext
+        credentials go on air.**
+
+        Returns the number of chunks written.
+
+        **Not verified against hardware.** Every field is read from
+        `SetWifiCommand.java` and `Utilities.m13402k` and cross-checked
+        against `TelinkDeviceBleManager.java:1361-1375`, and the encryption is
+        the same routine every confirmed command already uses - but no device
+        has actually been provisioned with it here, because doing so needs a
+        factory-fresh unit. Treat a silent success as unproven: this transport
+        has no acknowledgement, so a wrong payload looks exactly like a right
+        one from this side.
+        """
+        payload = build_wifi_payload(ssid, password, device_type)
+        chunks = build_wifi_chunks(payload)
+        for index, chunk in enumerate(chunks, start=1):
+            await self.send(target, OP_SET_WIFI, chunk, chunk_index=index)
+        logger.debug(
+            "%s: wrote Wi-Fi credentials for SSID %r as %d chunk(s)",
+            self._mac,
+            ssid,
+            len(chunks),
+        )
+        return len(chunks)
+
+    async def set_power(self, target: int, on: bool) -> None:
+        """Confirmed working on hardware."""
+        await self.send(target, OP_SET_POWER, bytes([1 if on else 0]))
+
+    async def set_brightness(
+        self, target: int, brightness: int, *, is_sol_lamp: bool = False
+    ) -> None:
+        """Confirmed on hardware, in both forms - which was not expected.
+
+        0xF0 with the six-byte payload changed a real wired dimmer's brightness,
+        verified through cync-lan's own reporting over TCP. So did 0xD2 with a
+        bare brightness byte, on the same device, even though that is documented
+        as the sol-lamp variant and devices.py only sends it to sol lamps.
+
+        The branch is kept regardless. Both being accepted does not make them
+        equivalent, and the verification channel would not have shown the
+        difference if there is one: cync-lan reports the brightness level, not
+        fade behaviour, not what survives a power cycle, not sub-percent
+        precision. Sending each device class the form it is documented to use
+        costs nothing and avoids a category of side effect nobody has examined.
+
+        `is_sol_lamp` mirrors devices.py's own discriminator; pass the device's
+        existing flag rather than guessing at it here.
+        """
+        bri = max(0, min(100, brightness))
+        if is_sol_lamp:
+            await self.send(target, OP_SET_BRIGHTNESS_SOL, bytes([bri, 0x00, 0x00]))
+        else:
+            await self.send(
+                target, OP_SET_LEVEL, bytes([0x01, bri, 0xFF, 0xFF, 0xFF, 0xFF])
+            )
+
+    async def set_colour_temp(
+        self, target: int, colour_temp: int, *, is_sol_lamp: bool = False
+    ) -> None:
+        """NOT confirmed over BLE, though the payloads now match devices.py.
+
+        Brightness in this same 0xF0 family is confirmed, so this is better
+        founded than a guess - but nobody has moved a colour temperature over
+        this transport.
+        """
+        temp = colour_temp & 0xFF
+        if is_sol_lamp:
+            await self.send(target, OP_SET_TEMP_SOL, bytes([0x05, temp, 0x00]))
+        else:
+            await self.send(
+                target, OP_SET_LEVEL, bytes([0x01, 0xFF, temp, 0x00, 0x00, 0x00])
+            )
+
+    async def set_rgb(self, target: int, red: int, green: int, blue: int) -> None:
+        """NOT confirmed over BLE.
+
+        No sol-lamp variant exists for this one - devices.py sends 0xF0
+        unconditionally.
+        """
+        await self.send(
+            target,
+            OP_SET_LEVEL,
+            bytes([0x01, 0xFF, 0xFE, red & 0xFF, green & 0xFF, blue & 0xFF]),
+        )
+
+    # ------------------------------------------------------------------
+    # The 0x8E family, ported from devices.py
+    #
+    # NOT CONFIRMED OVER BLE. Every payload below is byte-for-byte what
+    # devices.py puts inside its 0x8E relay envelope, and
+    # tests/test_ble_tcp_parity.py asserts that mechanically rather than by
+    # eye - so these are as well-founded as anything can be without
+    # hardware, and no better. The structural argument is strong: the relay
+    # envelope exists to get these onto this mesh, so removing it is the
+    # whole translation. That is a reason to believe, not evidence.
+    #
+    # `set_indicator_led` is the one whose TCP form was confirmed on real
+    # hardware, which is why its payload shape is trustworthy even though
+    # this transport for it is not.
+    # ------------------------------------------------------------------
+
+    async def set_indicator_led(
+        self,
+        target: int,
+        mode: int,
+        color: int,
+        brightness: int,
+        wifi_disconnect_blink: bool = False,
+    ) -> None:
+        """The small status ring, not the device's main light output.
+
+        mode: 0=always on, 1=always off, 2=normal. color: 0=white, 1=red,
+        2=green, 3=blue - a four-value enum, not full RGB.
+        """
+        if mode not in (0, 1, 2):
+            raise BleMeshError(f"indicator mode must be 0, 1 or 2, got {mode}")
+        if color not in (0, 1, 2, 3):
+            raise BleMeshError(f"indicator color must be 0-3, got {color}")
+        if not 1 <= brightness <= 100:
+            raise BleMeshError(f"indicator brightness must be 1-100, got {brightness}")
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes(
+                [
+                    SUB_INDICATOR_LED,
+                    (mode << 4) | color,
+                    brightness,
+                    1 if wifi_disconnect_blink else 0,
+                ]
+            ),
+        )
+
+    async def set_dimmer_led_mode(self, target: int, mode: int) -> None:
+        """Which way a dimmer switch's level bar behaves.
+
+        1 briefly displays the level on change, 2 keeps it lit.
+        """
+        if mode not in (DIMMER_LED_BRIEFLY_DISPLAY, DIMMER_LED_ALWAYS_ON):
+            raise BleMeshError(
+                f"dimmer led mode must be {DIMMER_LED_BRIEFLY_DISPLAY} "
+                f"(briefly display) or {DIMMER_LED_ALWAYS_ON} (always on), "
+                f"got {mode}"
+            )
+        await self.send(
+            target, OP_VENDOR_SETTINGS, bytes([SUB_DIMMER_LED_MODE, mode & 0xFF])
+        )
+
+    async def set_dimmer_led_brightness(self, target: int, level: int) -> None:
+        """Preview then save, exactly as devices.py sends it.
+
+        Two packets rather than one: the device shows the level while the
+        slider moves and keeps it when the save arrives. Sending only the
+        preview leaves the setting untouched once the device times out.
+        """
+        if not 0 <= level <= 100:
+            raise BleMeshError(f"level must be 0-100, got {level}")
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes([SUB_DIMMER_LED_LEVEL, DIMMER_LED_ACTION_PREVIEW, 0xF0, level]),
+        )
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes([SUB_DIMMER_LED_LEVEL, DIMMER_LED_ACTION_SAVE]),
+        )
+
+    async def set_multicolor_gradient_mode(self, target: int, enabled: bool) -> None:
+        """Blend between segments, rather than stepping."""
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes([SUB_MULTICOLOR, 0x00, 1 if enabled else 0]),
+        )
+
+    async def set_multicolor_segment_count(self, target: int, count: int) -> None:
+        """How many independently addressable segments the strip presents."""
+        await self.send(
+            target, OP_VENDOR_SETTINGS, bytes([SUB_MULTICOLOR, 0xFF, count & 0xFF])
+        )
+
+    async def set_light_effect(
+        self, target: int, mode_code: int, index: int, nonce: int
+    ) -> None:
+        """A factory effect preset - Static, LightShow, MusicShow, Reveal,
+        MultiColor - selected by mode code and index.
+
+        Not part of the 0x8E family: this one rides 0xE2 with the vendor id
+        leading its payload on TCP, so the opcode is the outer op rather
+        than the payload's first byte. Same decomposition, different place
+        to cut.
+        """
+        await self.send(
+            target,
+            OP_SET_TEMP_SOL,  # 0xE2, shared with the sol-lamp CCT command
+            bytes([0x07, mode_code & 0xFF, index & 0xFF, nonce & 0xFF]),
+        )
