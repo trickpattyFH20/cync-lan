@@ -24,14 +24,18 @@ class EffectTarget:
 
 class EffectCatalog:
     """Effect names in list order: built-ins first, then saved layouts and
-    shows. A saved name that clashes with one already taken (ignoring case)
-    gets its kind and slot appended, e.g. "Candle (show 12)"."""
+    shows. A saved name that clashes with one already taken (ignoring case),
+    or with a reserved name such as HA's "off", gets its kind and slot
+    appended, e.g. "Candle (show 12)". Reserved names are not playable here;
+    the caller handles them."""
 
     def __init__(
         self,
         builtins: Mapping[str, tuple[int, int, int]],
         saved: Iterable[SavedEffect] = (),
+        reserved: Iterable[str] = (),
     ) -> None:
+        self._taken: set[str] = {name.casefold() for name in reserved}
         self._targets: dict[str, EffectTarget] = {}
         self._folded: dict[str, EffectTarget] = {}
         self._names: dict[tuple[int, int], str] = {}
@@ -42,7 +46,7 @@ class EffectCatalog:
                 self._names.setdefault((mode, index), name)
         for effect in saved:
             name = effect.name
-            if name.casefold() in self._folded:
+            if name.casefold() in self._taken:
                 kind = "layout" if effect.mode == RunMode.MULTI_COLOR else "show"
                 name = f"{effect.name} ({kind} {effect.index})"
             self._add(name, EffectTarget(int(effect.mode), effect.index))
@@ -51,6 +55,7 @@ class EffectCatalog:
     def _add(self, name: str, target: EffectTarget) -> None:
         self._targets[name] = target
         self._folded.setdefault(name.casefold(), target)
+        self._taken.add(name.casefold())
 
     @property
     def names(self) -> list[str]:

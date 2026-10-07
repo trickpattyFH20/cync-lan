@@ -61,3 +61,11 @@ def test_clashing_names_get_kind_and_slot() -> None:
 
 def test_no_saved_effects_is_just_the_builtins() -> None:
     assert EffectCatalog(BUILTINS).names == ["candle", "static", "multicolor"]
+
+
+def test_reserved_names_are_taken_but_not_playable() -> None:
+    saved = [SavedEffect(RunMode.LIGHT_SHOW, 12, "Off")]
+    catalog = EffectCatalog(BUILTINS, saved, reserved=("off",))
+    assert catalog.names[-1] == "Off (show 12)"
+    assert catalog.target("off") is None
+    assert catalog.target("Off (show 12)") == EffectTarget(1, 12)

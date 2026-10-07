@@ -1058,7 +1058,7 @@ def _dynamic_node(**overrides):
 
 def test_dynamic_light_lists_saved_effects_after_builtins():
     entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node(), saved_effects=SAVED)
-    assert entity.effect_list[0] == "candle"
+    assert entity.effect_list[1] == "candle"
     assert entity.effect_list[-2:] == ["Holly", "Spooky"]
 
 
@@ -1077,11 +1077,68 @@ async def test_turn_on_saved_effect_plays_its_slot():
     node.set_light_effect.assert_not_awaited()
 
 
-async def test_turn_on_effect_off_stops_the_show():
-    node = _dynamic_node()
-    entity = CyncLanLight(MagicMock(), "entry1", node)
+async def _light_showing(hass, mode_byte, node=None, saved=SAVED):
+    bridge = CyncLanBridge(hass, "entry1")
+    node = node or _dynamic_node()
+    entity = CyncLanLight(bridge, "entry1", node, saved_effects=saved)
+    await bridge.parse_entity_state(
+        EntityState(name="x", dev_id=5, power=1, brightness=100, temperature=mode_byte)
+    )
+    return entity, node
+
+
+async def test_turn_on_effect_off_stops_the_show(hass):
+    entity, node = await _light_showing(hass, 0x80)
     await entity.async_turn_on(effect="off")
     node.set_light_effect.assert_awaited_once_with("static")
+
+
+async def test_effect_off_stops_a_running_show_before_the_colour(hass):
+    """A scene restore sends rgb + effect: off; the stop goes first so the
+    colour is what stays on."""
+    entity, node = await _light_showing(hass, 0x80)
+    calls = MagicMock()
+    calls.attach_mock(node.set_light_effect, "set_light_effect")
+    calls.attach_mock(node.set_rgb, "set_rgb")
+    await entity.async_turn_on(effect="off", rgb_color=(0, 0, 255))
+    assert [c[0] for c in calls.mock_calls] == ["set_light_effect", "set_rgb"]
+    node.set_light_effect.assert_awaited_once_with("static")
+
+
+async def test_effect_off_on_a_plain_colour_sends_nothing_extra(hass):
+    """Scenes restore effect: off to every RGB light; with no show running
+    it must not add a Static command."""
+    entity, node = await _light_showing(hass, 254)
+    await entity.async_turn_on(effect="off", rgb_color=(0, 0, 255))
+    node.set_light_effect.assert_not_awaited()
+    node.set_rgb.assert_awaited_once_with(0, 0, 255)
+
+
+async def test_effect_off_on_a_light_without_effects_sends_nothing(hass):
+    node = _fake_node()  # brightness only: no effect list
+    entity = CyncLanLight(CyncLanBridge(hass, "entry1"), "entry1", node)
+    await entity.async_turn_on(effect="off", brightness=128)
+    node.set_light_effect.assert_not_awaited()
+    node.set_brightness.assert_awaited()
+
+
+async def test_unknown_effect_is_rejected_before_anything_is_sent(hass):
+    entity, node = await _light_showing(hass, 254)
+    with pytest.raises(ServiceValidationError):
+        await entity.async_turn_on(effect="no such show", rgb_color=(0, 0, 255))
+    node.set_rgb.assert_not_awaited()
+
+
+def test_effect_list_offers_off_first():
+    entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node(), saved_effects=SAVED)
+    assert entity.effect_list[0] == "off"
+
+
+def test_a_saved_show_named_off_is_renamed():
+    saved = [SavedEffect(RunMode.LIGHT_SHOW, 12, "Off")]
+    entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node(), saved_effects=saved)
+    assert "Off (show 12)" in entity.effect_list
+    assert [n.casefold() for n in entity.effect_list].count("off") == 1
 
 
 async def test_turn_on_unknown_effect_is_a_clear_error():
@@ -1102,6 +1159,8 @@ async def test_turn_on_unknown_effect_is_a_clear_error():
         (0x97, None),  # a show saved in the app after the last export
         (254, "off"),  # RGB colour
         (40, "off"),  # white (also what Static left on the deck)
+        (101, None),  # not white, not a known effect: unknown, not "off"
+        (0xFF, None),
     ],
 )
 async def test_effect_follows_the_status_mode_byte(hass, mode_byte, expected):

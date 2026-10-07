@@ -45,7 +45,7 @@ from .const import (
     DOMAIN,
 )
 from .bridge import CyncLanBridge, signal_saved_effects_updated
-from .effects import EffectCatalog
+from .effects import EffectCatalog, EffectTarget
 from .entity import CyncLanEntity, CyncLanIndicatorLedEntity
 from .groups import apply_group_member_visibility, wait_for_member_entities
 
@@ -344,9 +344,11 @@ class CyncLanLight(CyncLanEntity, LightEntity):
         capabilities = getattr(self._node.metadata, "capabilities", None)
         dynamic = getattr(capabilities, "dynamic", False) is True
         self._catalog = EffectCatalog(
-            _light_run_mode_effects(), saved_effects if dynamic else ()
+            _light_run_mode_effects(),
+            saved_effects if dynamic else (),
+            reserved=(EFFECT_OFF,),
         )
-        self._attr_effect_list = self._catalog.names
+        self._attr_effect_list = [EFFECT_OFF, *self._catalog.names]
 
     @callback
     def async_set_saved_effects(self, saved_effects: Iterable["SavedEffect"]) -> None:
@@ -362,22 +364,28 @@ class CyncLanLight(CyncLanEntity, LightEntity):
         """What the light reports it is showing (the status mode byte, see
         cync_lan.effects.effect_from_status): EFFECT_OFF for plain white or
         colour, None for a slot this list has no name for (e.g. a show saved
-        in the app after the last cloud export)."""
+        in the app after the last cloud export) or a byte not decoded yet."""
         if self._catalog is None:
             return None
         state = self._entity_state()
-        if state is None:
+        if state is None or state.temperature is None:
             return None
         slot = effect_from_status(state.temperature)
-        if slot is None:
+        if slot is not None:
+            return self._catalog.name_for(int(slot[0]), slot[1])
+        # Only white (0-100) and RGB mean "no effect"; any other byte is
+        # something not decoded yet (Reveal, say), so unknown rather than off.
+        if state.temperature == RGB_MODE_SENTINEL or 0 <= state.temperature <= 100:
             return EFFECT_OFF
-        return self._catalog.name_for(int(slot[0]), slot[1])
+        return None
 
-    async def _async_play_effect(self, name: str) -> None:
+    def _resolve_effect(self, name: str) -> tuple[bool, EffectTarget | None]:
+        """Check an effect name before anything is sent. Returns (stop_first,
+        target). EFFECT_OFF stops a running show; scenes restore it along
+        with every colour, so a light already showing none gets no extra
+        command."""
         if name == EFFECT_OFF:
-            # Static stops a show; the app's Stop sends the same command.
-            await self._node.set_light_effect("static")
-            return
+            return (self._catalog is not None and self.effect != EFFECT_OFF, None)
         target = self._catalog.target(name) if self._catalog else None
         if target is None:
             raise ServiceValidationError(
@@ -385,12 +393,24 @@ class CyncLanLight(CyncLanEntity, LightEntity):
                 translation_key="unknown_effect",
                 translation_placeholders={"effect": name},
             )
+        return (False, target)
+
+    async def _async_play(self, target: EffectTarget) -> None:
         if target.builtin is not None:
             await self._node.set_light_effect(target.builtin)
         else:
             await self._node.play_effect(target.mode, target.index)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        stop_first, effect_target = (
+            self._resolve_effect(kwargs[ATTR_EFFECT])
+            if ATTR_EFFECT in kwargs
+            else (False, None)
+        )
+        if stop_first:
+            # Static stops a show (the app's Stop sends the same). It goes
+            # before any colour, so the colour is what stays on.
+            await self._node.set_light_effect("static")
         if ATTR_RGB_COLOR in kwargs:
             r, g, b = kwargs[ATTR_RGB_COLOR]
             await self._node.set_rgb(r, g, b)
@@ -405,8 +425,8 @@ class CyncLanLight(CyncLanEntity, LightEntity):
                     kwargs[ATTR_COLOR_TEMP_KELVIN], _kelvin_features(self._node)
                 )
             )
-        if ATTR_EFFECT in kwargs:
-            await self._async_play_effect(kwargs[ATTR_EFFECT])
+        if effect_target is not None:
+            await self._async_play(effect_target)
         bri_pct = (
             round(kwargs[ATTR_BRIGHTNESS] * 100 / 255)
             if ATTR_BRIGHTNESS in kwargs
