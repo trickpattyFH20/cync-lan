@@ -497,6 +497,23 @@ class nCyncServer:
             self.tcp_conn_attempts[client_addr] = 1
         lp = f"{self.lp}new_conn:{client_addr}:"
         existing_device = await self.remove_tcp_device(client_addr)
+        if existing_device is not None and existing_device.passthrough:
+            # A passthrough relay belongs to one TCP connection: the cloud has
+            # to see the new connection's handshake from its first byte, which
+            # only a fresh session's start_tasks() arranges. Reusing the old
+            # session orphaned its relay task in existing_init(); the orphan
+            # read EOF when the old cloud connection closed, and the fallback
+            # it ran tore down the new relay. Stop the old relay deliberately
+            # (a cancelled relay task does not fall back), close the session,
+            # and let the new connection start over. Capture sessions
+            # (mitm_mode without passthrough) keep being reused below.
+            logger.debug(
+                f"{lp} Existing relayed session found, stopping its relay and "
+                "replacing it..."
+            )
+            await existing_device.stop_proxy()
+            await existing_device.close()
+            existing_device = None
         if existing_device is not None:
             _add_str = ""
             if not existing_device.mitm_mode:

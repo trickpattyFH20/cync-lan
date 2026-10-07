@@ -365,6 +365,13 @@ def _cloud_passthrough_enabled() -> bool:
     return raw.strip().casefold() in ("1", "true", "yes", "on")
 
 
+# How long start_proxy() waits for the cloud before giving up. A device whose
+# relay is being set up has its own handshake unread until this returns, and an
+# outage that drops packets (rather than refusing them) would otherwise hold it
+# for the OS connect timeout - minutes.
+CLOUD_CONNECT_TIMEOUT = 5.0
+
+
 def _cloud_endpoint() -> tuple[str, int]:
     """Where the real cloud lives, re-read alongside the toggle itself."""
     host = os.environ.get("CYNC_CLOUD_IP", CYNC_CLOUD_IP).strip()
@@ -3431,8 +3438,9 @@ class CyncTCPSession:
             logger.info(
                 f"{lp} Connecting to Cync Cloud via IP ({cloud_host}:{cloud_port})..."
             )
-            self.cloud_reader, self.cloud_writer = await asyncio.open_connection(
-                cloud_host, cloud_port, ssl=ssl_context
+            self.cloud_reader, self.cloud_writer = await asyncio.wait_for(
+                asyncio.open_connection(cloud_host, cloud_port, ssl=ssl_context),
+                timeout=CLOUD_CONNECT_TIMEOUT,
             )
             # getattr, not self.node.id: the third place this bit. Every
             # caller used to arrive from a per-node switch entity, so a node
@@ -3632,11 +3640,18 @@ class CyncTCPSession:
                 logger.debug(f"{lp} Cloud reader feed_eof error (ignored): {e}")
         self.cloud_reader = None
 
-        if self.cloud_writer:
+        # Taken before the first await so a second caller (the passthrough
+        # fallback racing a reconnect) finds nothing to close, and shielded
+        # because wait_closed() waits on the connection's one close-waiter
+        # future: cancelling this caller must not cancel it for anyone else.
+        cloud_writer, self.cloud_writer = self.cloud_writer, None
+        if cloud_writer:
             logger.debug(f"{lp} Closing cloud writer...")
             try:
-                self.cloud_writer.close()
-                await asyncio.wait_for(self.cloud_writer.wait_closed(), timeout=5.0)
+                cloud_writer.close()
+                await asyncio.wait_for(
+                    asyncio.shield(cloud_writer.wait_closed()), timeout=5.0
+                )
                 logger.debug(f"{lp} Cloud writer closed cleanly")
             except asyncio.TimeoutError:
                 logger.warning(
