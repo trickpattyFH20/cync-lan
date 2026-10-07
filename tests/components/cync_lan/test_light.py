@@ -5,6 +5,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from cync_lan.effects import RunMode, SavedEffect
+from cync_lan.structs import EntityState
+from homeassistant.exceptions import ServiceValidationError
+
 from custom_components.cync_lan.bridge import CyncLanBridge
 from custom_components.cync_lan.const import DOMAIN
 from custom_components.cync_lan.light import (
@@ -1008,6 +1013,7 @@ async def test_the_two_presentations_are_exclusive(hass):
         entry.runtime_data = SimpleNamespace(
             bridge=MagicMock(),
             groups={},
+            saved_effects={},
             ncync_server=SimpleNamespace(node_devices={7: node}),
         )
         return entry
@@ -1035,3 +1041,179 @@ async def test_the_two_presentations_are_exclusive(hass):
         hass, _entry(False), lambda e, *a: off_sel.extend(e)
     )
     assert any("IndicatorLed" in n for n in names(off_sel))
+
+
+SAVED = [
+    SavedEffect(RunMode.LIGHT_SHOW, 10, "Holly"),
+    SavedEffect(RunMode.MULTI_COLOR, 3, "Spooky"),
+]
+
+
+def _dynamic_node(**overrides):
+    node = _fake_node(supports_rgb=True, **overrides)
+    node.metadata.capabilities = SimpleNamespace(dynamic=True)
+    node.play_effect = AsyncMock()
+    return node
+
+
+def test_dynamic_light_lists_saved_effects_after_builtins():
+    entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node(), saved_effects=SAVED)
+    assert entity.effect_list[1] == "candle"
+    assert entity.effect_list[-2:] == ["Holly", "Spooky"]
+
+
+def test_plain_rgb_light_ignores_saved_effects():
+    node = _fake_node(supports_rgb=True)
+    node.metadata.capabilities = SimpleNamespace(dynamic=False)
+    entity = CyncLanLight(MagicMock(), "entry1", node, saved_effects=SAVED)
+    assert "Holly" not in entity.effect_list
+
+
+async def test_turn_on_saved_effect_plays_its_slot():
+    node = _dynamic_node()
+    entity = CyncLanLight(MagicMock(), "entry1", node, saved_effects=SAVED)
+    await entity.async_turn_on(effect="Spooky")
+    node.play_effect.assert_awaited_once_with(4, 3)
+    node.set_light_effect.assert_not_awaited()
+
+
+async def _light_showing(hass, mode_byte, node=None, saved=SAVED):
+    bridge = CyncLanBridge(hass, "entry1")
+    node = node or _dynamic_node()
+    entity = CyncLanLight(bridge, "entry1", node, saved_effects=saved)
+    await bridge.parse_entity_state(
+        EntityState(name="x", dev_id=5, power=1, brightness=100, temperature=mode_byte)
+    )
+    return entity, node
+
+
+async def test_turn_on_effect_off_stops_the_show(hass):
+    entity, node = await _light_showing(hass, 0x80)
+    await entity.async_turn_on(effect="off")
+    node.set_light_effect.assert_awaited_once_with("static")
+
+
+async def test_effect_off_stops_a_running_show_before_the_colour(hass):
+    """A scene restore sends rgb + effect: off; the stop goes first so the
+    colour is what stays on."""
+    entity, node = await _light_showing(hass, 0x80)
+    calls = MagicMock()
+    calls.attach_mock(node.set_light_effect, "set_light_effect")
+    calls.attach_mock(node.set_rgb, "set_rgb")
+    await entity.async_turn_on(effect="off", rgb_color=(0, 0, 255))
+    assert [c[0] for c in calls.mock_calls] == ["set_light_effect", "set_rgb"]
+    node.set_light_effect.assert_awaited_once_with("static")
+
+
+async def test_effect_off_on_a_plain_colour_sends_nothing_extra(hass):
+    """Scenes restore effect: off to every RGB light; with no show running
+    it must not add a Static command."""
+    entity, node = await _light_showing(hass, 254)
+    await entity.async_turn_on(effect="off", rgb_color=(0, 0, 255))
+    node.set_light_effect.assert_not_awaited()
+    node.set_rgb.assert_awaited_once_with(0, 0, 255)
+
+
+async def test_effect_off_on_a_light_without_effects_sends_nothing(hass):
+    node = _fake_node()  # brightness only: no effect list
+    entity = CyncLanLight(CyncLanBridge(hass, "entry1"), "entry1", node)
+    await entity.async_turn_on(effect="off", brightness=128)
+    node.set_light_effect.assert_not_awaited()
+    node.set_brightness.assert_awaited()
+
+
+async def test_unknown_effect_is_rejected_before_anything_is_sent(hass):
+    entity, node = await _light_showing(hass, 254)
+    with pytest.raises(ServiceValidationError):
+        await entity.async_turn_on(effect="no such show", rgb_color=(0, 0, 255))
+    node.set_rgb.assert_not_awaited()
+
+
+def test_effect_list_offers_off_first():
+    entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node(), saved_effects=SAVED)
+    assert entity.effect_list[0] == "off"
+
+
+def test_a_saved_show_named_off_is_renamed():
+    saved = [SavedEffect(RunMode.LIGHT_SHOW, 12, "Off")]
+    entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node(), saved_effects=saved)
+    assert "Off (show 12)" in entity.effect_list
+    assert [n.casefold() for n in entity.effect_list].count("off") == 1
+
+
+async def test_turn_on_unknown_effect_is_a_clear_error():
+    node = _dynamic_node()
+    entity = CyncLanLight(MagicMock(), "entry1", node)
+    with pytest.raises(ServiceValidationError):
+        await entity.async_turn_on(effect="no such show")
+    node.set_light_effect.assert_not_awaited()
+    node.play_effect.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("mode_byte", "expected"),
+    [
+        (0x80, "candle"),
+        (0x89, "Holly"),
+        (0xC2, "Spooky"),
+        (0x97, None),  # a show saved in the app after the last export
+        (254, "off"),  # RGB colour
+        (40, "off"),  # white (also what Static left on the deck)
+        (101, None),  # not white, not a known effect: unknown, not "off"
+        (0xFF, None),
+    ],
+)
+async def test_effect_follows_the_status_mode_byte(hass, mode_byte, expected):
+    bridge = CyncLanBridge(hass, "entry1")
+    entity = CyncLanLight(bridge, "entry1", _dynamic_node(), saved_effects=SAVED)
+    await bridge.parse_entity_state(
+        EntityState(name="x", dev_id=5, power=1, brightness=100, temperature=mode_byte)
+    )
+    assert entity.effect == expected
+
+
+def test_effect_is_none_without_state(hass):
+    entity = CyncLanLight(CyncLanBridge(hass, "entry1"), "entry1", _dynamic_node())
+    assert entity.effect is None
+
+
+def test_async_set_saved_effects_rebuilds_the_list():
+    entity = CyncLanLight(MagicMock(), "entry1", _dynamic_node())
+    assert "Holly" not in entity.effect_list
+    entity.async_set_saved_effects(SAVED)
+    assert entity.effect_list[-2:] == ["Holly", "Spooky"]
+
+
+async def test_setup_entry_gives_each_light_its_homes_saved_effects(hass):
+    light = _dynamic_node(home_id=1234)
+    entry = MagicMock()
+    entry.entry_id = "entry1"
+    entry.options = {}
+    entry.runtime_data.bridge = CyncLanBridge(hass, "entry1")
+    entry.runtime_data.ncync_server.node_devices = {5: light}
+    entry.runtime_data.saved_effects = {1234: SAVED, 999: [SavedEffect(RunMode.LIGHT_SHOW, 11, "Other")]}
+
+    added = []
+    await async_setup_entry(hass, entry, lambda entities: added.extend(entities))
+
+    assert added[0].effect_list[-2:] == ["Holly", "Spooky"]
+    assert "Other" not in added[0].effect_list
+
+
+async def test_saved_effects_signal_reaches_the_light(hass):
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+    from custom_components.cync_lan.bridge import signal_saved_effects_updated
+
+    entity = CyncLanLight(
+        CyncLanBridge(hass, "entry1"), "entry1", _dynamic_node(home_id=1234)
+    )
+    entity.hass = hass
+    entity.async_write_ha_state = MagicMock()
+    await entity.async_added_to_hass()
+
+    async_dispatcher_send(hass, signal_saved_effects_updated("entry1"), {1234: SAVED})
+    await hass.async_block_till_done()
+
+    assert entity.effect_list[-2:] == ["Holly", "Spooky"]
+    entity.async_write_ha_state.assert_called()

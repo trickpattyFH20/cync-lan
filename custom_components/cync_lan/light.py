@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, KeysView
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from cync_lan.classify import (
     DEFAULT_MAX_KELVIN,
@@ -11,6 +12,7 @@ from cync_lan.classify import (
     cync_to_kelvin,
     kelvin_to_cync,
 )
+from cync_lan.effects import effect_from_status
 
 from homeassistant.components.group.light import LightGroup
 from homeassistant.components.light import (
@@ -19,13 +21,16 @@ from homeassistant.components.light import (
     ATTR_EFFECT,
     ATTR_RGB_COLOR,
     ATTR_TRANSITION,
+    EFFECT_OFF,
     LightEntity,
 )
 from homeassistant.components.light.const import ColorMode, LightEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -39,12 +44,14 @@ from .const import (
     DEFAULT_INDICATOR_LED_AS_LIGHT,
     DOMAIN,
 )
-from .bridge import CyncLanBridge
+from .bridge import CyncLanBridge, signal_saved_effects_updated
+from .effects import EffectCatalog, EffectTarget
 from .entity import CyncLanEntity, CyncLanIndicatorLedEntity
 from .groups import apply_group_member_visibility, wait_for_member_entities
 
 if TYPE_CHECKING:
     from cync_lan.devices import CyncDevice
+    from cync_lan.effects import SavedEffect
 
 
 # parallel-updates (silver): each light entity issues its own independent
@@ -59,6 +66,7 @@ async def async_setup_entry(
 ) -> None:
     runtime_data = entry.runtime_data
     bridge = runtime_data.bridge
+    saved_effects = runtime_data.saved_effects or {}
     entities: list[LightEntity] = []
     light_dev_ids = []
     for node in runtime_data.ncync_server.node_devices.values():
@@ -66,7 +74,14 @@ async def async_setup_entry(
             continue
         if not node.is_light:
             continue
-        entities.append(CyncLanLight(bridge, entry.entry_id, node))
+        entities.append(
+            CyncLanLight(
+                bridge,
+                entry.entry_id,
+                node,
+                saved_effects=saved_effects.get(node.home_id, ()),
+            )
+        )
         light_dev_ids.append(node.id)
 
     # The status ring as a light, when the user has chosen that form. It is
@@ -209,15 +224,20 @@ class CyncLanLight(CyncLanEntity, LightEntity):
     _attr_name = None  # has-entity-name: device name is the entity name
 
     def __init__(
-        self, bridge: CyncLanBridge, entry_id: str, node: "CyncDevice"
+        self,
+        bridge: CyncLanBridge,
+        entry_id: str,
+        node: "CyncDevice",
+        saved_effects: Iterable["SavedEffect"] = (),
     ) -> None:
         super().__init__(bridge, entry_id, node)
+        self._catalog: EffectCatalog | None = None
         modes: set[ColorMode] = set()
         if node.supports_temperature:
             modes.add(ColorMode.COLOR_TEMP)
         if node.supports_rgb:
             modes.add(ColorMode.RGB)
-            self._attr_effect_list = list(_light_run_mode_effects())
+            self._set_catalog(saved_effects)
             self._attr_supported_features = LightEntityFeature.EFFECT
         if not modes:
             modes.add(ColorMode.BRIGHTNESS)
@@ -302,7 +322,95 @@ class CyncLanLight(CyncLanEntity, LightEntity):
             return {"min_brightness_pct": 5}
         return None
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._catalog is not None:
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass,
+                    signal_saved_effects_updated(self._entry_id),
+                    self._handle_saved_effects,
+                )
+            )
+
+    @callback
+    def _handle_saved_effects(self, saved: dict[int, list["SavedEffect"]]) -> None:
+        home_id = self._node.home_id
+        self.async_set_saved_effects(saved.get(home_id, ()) if home_id is not None else ())
+
+    def _set_catalog(self, saved_effects: Iterable["SavedEffect"]) -> None:
+        # Saved layouts and shows are for dynamic-effects lights (string
+        # lights, strips); a plain RGB bulb in the same home cannot play them.
+        capabilities = getattr(self._node.metadata, "capabilities", None)
+        dynamic = getattr(capabilities, "dynamic", False) is True
+        self._catalog = EffectCatalog(
+            _light_run_mode_effects(),
+            saved_effects if dynamic else (),
+            reserved=(EFFECT_OFF,),
+        )
+        self._attr_effect_list = [EFFECT_OFF, *self._catalog.names]
+
+    @callback
+    def async_set_saved_effects(self, saved_effects: Iterable["SavedEffect"]) -> None:
+        """New saved layouts/shows from a cloud export refresh."""
+        if self._catalog is None:
+            return
+        self._set_catalog(saved_effects)
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @property
+    def effect(self) -> str | None:
+        """What the light reports it is showing (the status mode byte, see
+        cync_lan.effects.effect_from_status): EFFECT_OFF for plain white or
+        colour, None for a slot this list has no name for (e.g. a show saved
+        in the app after the last cloud export) or a byte not decoded yet."""
+        if self._catalog is None:
+            return None
+        state = self._entity_state()
+        if state is None or state.temperature is None:
+            return None
+        slot = effect_from_status(state.temperature)
+        if slot is not None:
+            return self._catalog.name_for(int(slot[0]), slot[1])
+        # Only white (0-100) and RGB mean "no effect"; any other byte is
+        # something not decoded yet (Reveal, say), so unknown rather than off.
+        if state.temperature == RGB_MODE_SENTINEL or 0 <= state.temperature <= 100:
+            return EFFECT_OFF
+        return None
+
+    def _resolve_effect(self, name: str) -> tuple[bool, EffectTarget | None]:
+        """Check an effect name before anything is sent. Returns (stop_first,
+        target). EFFECT_OFF stops a running show; scenes restore it along
+        with every colour, so a light already showing none gets no extra
+        command."""
+        if name == EFFECT_OFF:
+            return (self._catalog is not None and self.effect != EFFECT_OFF, None)
+        target = self._catalog.target(name) if self._catalog else None
+        if target is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="unknown_effect",
+                translation_placeholders={"effect": name},
+            )
+        return (False, target)
+
+    async def _async_play(self, target: EffectTarget) -> None:
+        if target.builtin is not None:
+            await self._node.set_light_effect(target.builtin)
+        else:
+            await self._node.play_effect(target.mode, target.index)
+
     async def async_turn_on(self, **kwargs: Any) -> None:
+        stop_first, effect_target = (
+            self._resolve_effect(kwargs[ATTR_EFFECT])
+            if ATTR_EFFECT in kwargs
+            else (False, None)
+        )
+        if stop_first:
+            # Static stops a show (the app's Stop sends the same). It goes
+            # before any colour, so the colour is what stays on.
+            await self._node.set_light_effect("static")
         if ATTR_RGB_COLOR in kwargs:
             r, g, b = kwargs[ATTR_RGB_COLOR]
             await self._node.set_rgb(r, g, b)
@@ -317,8 +425,8 @@ class CyncLanLight(CyncLanEntity, LightEntity):
                     kwargs[ATTR_COLOR_TEMP_KELVIN], _kelvin_features(self._node)
                 )
             )
-        if ATTR_EFFECT in kwargs:
-            await self._node.set_light_effect(kwargs[ATTR_EFFECT])
+        if effect_target is not None:
+            await self._async_play(effect_target)
         bri_pct = (
             round(kwargs[ATTR_BRIGHTNESS] * 100 / 255)
             if ATTR_BRIGHTNESS in kwargs
@@ -428,13 +536,13 @@ class CyncLanLightGroup(LightGroup):
         await super().async_turn_off(**kwargs)
 
 
-def _light_run_mode_effects() -> KeysView[str]:
+def _light_run_mode_effects() -> Mapping[str, tuple[int, int, int]]:
     """Deferred import: cync_lan.const reads its env-var-backed constants at
     import time, so it must not be imported before configure_environment()
     has run (see util.configure_environment's docstring)."""
     from cync_lan.const import LIGHT_RUN_MODE_EFFECTS
 
-    return LIGHT_RUN_MODE_EFFECTS.keys()
+    return LIGHT_RUN_MODE_EFFECTS
 
 
 # The four colours the ring can actually be, and the RGB each one is meant to

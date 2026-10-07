@@ -402,6 +402,13 @@ class CyncLanOptionsFlow(config_entries.OptionsFlow):
             except Exception:  # noqa: BLE001 - groups are optional, must not block setup
                 _LOGGER.exception("Failed to parse refreshed Cync device groups")
 
+            # The same export carries the layouts/shows saved in the Cync app;
+            # hand any change to the lights now rather than at the next
+            # periodic refresh.
+            from . import _apply_saved_effects
+
+            await _apply_saved_effects(self.hass, entry, Path(CYNC_CONFIG_FILE_PATH))
+
         from .light import async_add_light_groups
         from .switch import async_add_switch_groups
 
