@@ -30,10 +30,11 @@ from homeassistant.helpers import (
     entity_registry as er,
     issue_registry as ir,
 )
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
-from .bridge import CyncLanBridge
+from .bridge import CyncLanBridge, signal_saved_effects_updated
 from .const import (
     CONF_ACCOUNT_PASSWORD,
     CONF_CAPTURE_FIRMWARE,
@@ -121,6 +122,7 @@ class CyncLanRuntimeData:
     schedules: Optional[dict[int, dict[str, Any]]] = (
         None  # {schedule_id: {"name", "scene_id", "enabled"}}
     )
+    saved_effects: Optional[dict[int, list[Any]]] = None  # {home_id: [SavedEffect]}
     unsub_refresh: Optional[CALLBACK_TYPE] = None
     unsub_no_devices_check: Optional[CALLBACK_TYPE] = None
     # Stashed by light.py's async_setup_entry so light groups can be added
@@ -146,6 +148,7 @@ def _import_cync_lan_symbols() -> tuple[
     Callable[[Path], Coroutine[Any, Any, dict[int, Any]]],
     Callable[[Path], Coroutine[Any, Any, dict[int, Any]]],
     Callable[[Path], Coroutine[Any, Any, dict[int, Any]]],
+    Callable[[Path], Coroutine[Any, Any, dict[int, Any]]],
 ]:
     """Import the upstream cync_lan package's heavy modules - meant to run
     inside an executor, not called directly from the event loop.
@@ -165,7 +168,13 @@ def _import_cync_lan_symbols() -> tuple[
     from cync_lan.const import CYNC_CONFIG_FILE_PATH
     from cync_lan.server import nCyncServer
     from cync_lan.structs import GlobalObject
-    from cync_lan.utils import parse_config, parse_groups, parse_schedules, parse_scenes
+    from cync_lan.utils import (
+        parse_config,
+        parse_groups,
+        parse_saved_effects,
+        parse_schedules,
+        parse_scenes,
+    )
 
     return (
         CYNC_CONFIG_FILE_PATH,
@@ -175,6 +184,7 @@ def _import_cync_lan_symbols() -> tuple[
         parse_groups,
         parse_scenes,
         parse_schedules,
+        parse_saved_effects,
     )
 
 
@@ -211,6 +221,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         parse_groups,
         parse_scenes,
         parse_schedules,
+        parse_saved_effects,
     ) = await hass.async_add_executor_job(_import_cync_lan_symbols)
 
     cfg_file = Path(CYNC_CONFIG_FILE_PATH)
@@ -258,6 +269,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         schedules = await parse_schedules(cfg_file)
     except Exception:  # noqa: BLE001 - schedules are optional, must not block setup
         _LOGGER.exception("Failed to parse Cync schedules, continuing without them")
+
+    # Layouts and light shows saved in the Cync app, {home_id: [SavedEffect]} -
+    # same best-effort pattern: without them lights offer built-in effects only.
+    saved_effects: dict[int, Any] = {}
+    try:
+        saved_effects = await parse_saved_effects(cfg_file)
+    except Exception:  # noqa: BLE001 - saved effects are optional, must not block setup
+        _LOGGER.exception("Failed to parse saved Cync effects, continuing without them")
 
     async def _on_unknown_device_confirmed() -> None:
         # dynamic-devices (gold): a real new device was seen in a MeshInfo
@@ -310,6 +329,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         groups=groups,
         scenes=scenes,
         schedules=schedules,
+        saved_effects=saved_effects,
     )
     entry.runtime_data = runtime_data
 
@@ -386,6 +406,25 @@ def _config_mtime(cfg_file: Path) -> Optional[float]:
         return None
 
 
+async def _apply_saved_effects(
+    hass: HomeAssistant, entry: ConfigEntry, cfg_file: Path
+) -> None:
+    """Re-read the saved layouts/shows after an export refresh and hand a
+    change to the light entities - no reload, which would drop every
+    device's TCP session."""
+    from cync_lan.utils import parse_saved_effects
+
+    try:
+        saved = await parse_saved_effects(cfg_file)
+    except Exception:  # noqa: BLE001 - keep the last good list
+        _LOGGER.exception("Failed to re-read saved Cync effects, keeping the old list")
+        return
+    if saved == entry.runtime_data.saved_effects:
+        return
+    entry.runtime_data.saved_effects = saved
+    async_dispatcher_send(hass, signal_saved_effects_updated(entry.entry_id), saved)
+
+
 async def _refresh_export_and_reload_if_changed(
     hass: HomeAssistant, entry: ConfigEntry, cfg_file: Path
 ) -> None:
@@ -410,6 +449,7 @@ async def _refresh_export_and_reload_if_changed(
             return
 
         new_map = await parse_config(cfg_file)
+        await _apply_saved_effects(hass, entry, cfg_file)
         old_ids = set(entry.runtime_data.ncync_server.node_devices)
         new_ids = set(new_map)
         removed_ids = old_ids - new_ids

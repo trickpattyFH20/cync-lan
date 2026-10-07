@@ -1013,6 +1013,7 @@ async def test_the_two_presentations_are_exclusive(hass):
         entry.runtime_data = SimpleNamespace(
             bridge=MagicMock(),
             groups={},
+            saved_effects={},
             ncync_server=SimpleNamespace(node_devices={7: node}),
         )
         return entry
@@ -1122,3 +1123,38 @@ def test_async_set_saved_effects_rebuilds_the_list():
     assert "Holly" not in entity.effect_list
     entity.async_set_saved_effects(SAVED)
     assert entity.effect_list[-2:] == ["Holly", "Spooky"]
+
+
+async def test_setup_entry_gives_each_light_its_homes_saved_effects(hass):
+    light = _dynamic_node(home_id=1234)
+    entry = MagicMock()
+    entry.entry_id = "entry1"
+    entry.options = {}
+    entry.runtime_data.bridge = CyncLanBridge(hass, "entry1")
+    entry.runtime_data.ncync_server.node_devices = {5: light}
+    entry.runtime_data.saved_effects = {1234: SAVED, 999: [SavedEffect(RunMode.LIGHT_SHOW, 11, "Other")]}
+
+    added = []
+    await async_setup_entry(hass, entry, lambda entities: added.extend(entities))
+
+    assert added[0].effect_list[-2:] == ["Holly", "Spooky"]
+    assert "Other" not in added[0].effect_list
+
+
+async def test_saved_effects_signal_reaches_the_light(hass):
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+    from custom_components.cync_lan.bridge import signal_saved_effects_updated
+
+    entity = CyncLanLight(
+        CyncLanBridge(hass, "entry1"), "entry1", _dynamic_node(home_id=1234)
+    )
+    entity.hass = hass
+    entity.async_write_ha_state = MagicMock()
+    await entity.async_added_to_hass()
+
+    async_dispatcher_send(hass, signal_saved_effects_updated("entry1"), {1234: SAVED})
+    await hass.async_block_till_done()
+
+    assert entity.effect_list[-2:] == ["Holly", "Spooky"]
+    entity.async_write_ha_state.assert_called()

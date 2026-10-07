@@ -51,6 +51,12 @@ def signal_device_online(dev_id: int) -> str:
     return f"{DOMAIN}_online_{dev_id}"
 
 
+def signal_saved_effects_updated(entry_id: str) -> str:
+    """Dispatcher signal: the layouts/shows saved in the Cync app changed
+    after an export refresh; sent with {home_id: [SavedEffect]}."""
+    return f"{DOMAIN}_saved_effects_{entry_id}"
+
+
 def signal_indicator_led_update(entry_id: str, dev_id: int) -> str:
     """Dispatcher signal shared by all 4 indicator-LED entities for one
     device - they all read the same merged IndicatorLedState, so all 4 must

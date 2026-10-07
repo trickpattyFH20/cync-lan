@@ -30,6 +30,7 @@ from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -43,7 +44,7 @@ from .const import (
     DEFAULT_INDICATOR_LED_AS_LIGHT,
     DOMAIN,
 )
-from .bridge import CyncLanBridge
+from .bridge import CyncLanBridge, signal_saved_effects_updated
 from .effects import EffectCatalog
 from .entity import CyncLanEntity, CyncLanIndicatorLedEntity
 from .groups import apply_group_member_visibility, wait_for_member_entities
@@ -65,6 +66,7 @@ async def async_setup_entry(
 ) -> None:
     runtime_data = entry.runtime_data
     bridge = runtime_data.bridge
+    saved_effects = runtime_data.saved_effects or {}
     entities: list[LightEntity] = []
     light_dev_ids = []
     for node in runtime_data.ncync_server.node_devices.values():
@@ -72,7 +74,14 @@ async def async_setup_entry(
             continue
         if not node.is_light:
             continue
-        entities.append(CyncLanLight(bridge, entry.entry_id, node))
+        entities.append(
+            CyncLanLight(
+                bridge,
+                entry.entry_id,
+                node,
+                saved_effects=saved_effects.get(node.home_id, ()),
+            )
+        )
         light_dev_ids.append(node.id)
 
     # The status ring as a light, when the user has chosen that form. It is
@@ -312,6 +321,22 @@ class CyncLanLight(CyncLanEntity, LightEntity):
         if self._node.is_dimmer_switch:
             return {"min_brightness_pct": 5}
         return None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._catalog is not None:
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass,
+                    signal_saved_effects_updated(self._entry_id),
+                    self._handle_saved_effects,
+                )
+            )
+
+    @callback
+    def _handle_saved_effects(self, saved: dict[int, list["SavedEffect"]]) -> None:
+        home_id = self._node.home_id
+        self.async_set_saved_effects(saved.get(home_id, ()) if home_id is not None else ())
 
     def _set_catalog(self, saved_effects: Iterable["SavedEffect"]) -> None:
         # Saved layouts and shows are for dynamic-effects lights (string

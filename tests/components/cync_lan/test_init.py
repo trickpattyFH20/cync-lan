@@ -515,6 +515,90 @@ async def test_setup_entry_scene_parse_failure_does_not_block_setup(hass, tmp_pa
     assert entry.runtime_data.scenes == {}
 
 
+async def test_setup_entry_reads_saved_effects(hass, tmp_path):
+    from cync_lan.effects import RunMode, SavedEffect
+
+    cfg_file = tmp_path / "cync_mesh.yaml"
+    cfg_file.write_text("devices: {}")
+    entry = _make_entry()
+    entry.add_to_hass(hass)
+    saved = {1234: [SavedEffect(RunMode.MULTI_COLOR, 3, "Spooky")]}
+
+    server = _mock_server(running_after_start=True)
+    with (
+        patch("cync_lan.const.CYNC_CONFIG_FILE_PATH", str(cfg_file)),
+        patch("cync_lan.server.nCyncServer", return_value=server),
+        patch("cync_lan.utils.parse_config", new=AsyncMock(return_value={})),
+        patch("cync_lan.utils.parse_saved_effects", new=AsyncMock(return_value=saved)),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
+        from custom_components.cync_lan import async_setup_entry
+
+        await async_setup_entry(hass, entry)
+
+    assert entry.runtime_data.saved_effects == saved
+
+
+async def test_setup_entry_saved_effects_failure_does_not_block_setup(hass, tmp_path):
+    cfg_file = tmp_path / "cync_mesh.yaml"
+    cfg_file.write_text("devices: {}")
+    entry = _make_entry()
+    entry.add_to_hass(hass)
+
+    server = _mock_server(running_after_start=True)
+    with (
+        patch("cync_lan.const.CYNC_CONFIG_FILE_PATH", str(cfg_file)),
+        patch("cync_lan.server.nCyncServer", return_value=server),
+        patch("cync_lan.utils.parse_config", new=AsyncMock(return_value={})),
+        patch(
+            "cync_lan.utils.parse_saved_effects",
+            new=AsyncMock(side_effect=RuntimeError("bad yaml")),
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
+        from custom_components.cync_lan import async_setup_entry
+
+        result = await async_setup_entry(hass, entry)
+
+    assert result is True
+    assert entry.runtime_data.saved_effects == {}
+
+
+async def test_export_refresh_hands_changed_saved_effects_to_the_lights(hass, tmp_path):
+    from cync_lan.effects import RunMode, SavedEffect
+    from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+    from custom_components.cync_lan import _refresh_export_and_reload_if_changed
+    from custom_components.cync_lan.bridge import signal_saved_effects_updated
+
+    cfg_file = tmp_path / "cync_mesh.yaml"
+    entry = MagicMock()
+    entry.entry_id = "entry1"
+    entry.runtime_data.ncync_server.node_devices = {5: object()}
+    entry.runtime_data.saved_effects = {}
+    new_saved = {1234: [SavedEffect(RunMode.LIGHT_SHOW, 10, "Holly")]}
+    received = []
+    async_dispatcher_connect(hass, signal_saved_effects_updated("entry1"), received.append)
+
+    with (
+        patch("custom_components.cync_lan.refresh_cloud_export", new=AsyncMock()),
+        patch("custom_components.cync_lan._config_mtime", side_effect=[1.0, 2.0]),
+        patch("cync_lan.utils.parse_config", new=AsyncMock(return_value={5: object()})),
+        patch("cync_lan.utils.parse_saved_effects", new=AsyncMock(return_value=new_saved)),
+    ):
+        await _refresh_export_and_reload_if_changed(hass, entry, cfg_file)
+        await hass.async_block_till_done()
+
+    assert entry.runtime_data.saved_effects == new_saved
+    assert received == [new_saved]
+
+
 async def test_setup_entry_schedule_parse_failure_does_not_block_setup(hass, tmp_path):
     """Schedules are optional - a failure parsing them must not prevent the
     rest of setup from succeeding."""
