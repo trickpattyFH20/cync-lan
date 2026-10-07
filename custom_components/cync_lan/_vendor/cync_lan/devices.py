@@ -2456,6 +2456,24 @@ class CyncDevice:
         mode_code, index, nonce = LIGHT_RUN_MODE_EFFECTS[effect]
         await self._send_light_run_mode(mode_code, index, nonce, sub_id)
 
+    async def play_effect(
+        self, mode: int, index: int, sub_id: Optional[int] = None
+    ) -> None:
+        """Play a run-mode effect by mode and slot: a layout saved in the
+        Cync app (MultiColor 0x04, its slot), a saved light show (LightShow
+        0x01, slots 10-32) or any built-in - see cync_lan.effects.RunMode.
+
+        Captured on Cafe Lights (docs/cafe_lights_findings.md): the app sends
+        `e2 11 02 07 <mode> <index> 00` inside the 0x8E relay with nonce 00.
+        The direct op-0xE2 form sent here was confirmed on the same lights on
+        2026-10-07 (status mode byte 0x80 after candle).
+        """
+        if not 0 <= mode <= 0x04:
+            raise ValueError(f"mode must be 0-4, got {mode}")
+        if not 0 <= index <= 0xFF:
+            raise ValueError(f"index must be 0-255, got {index}")
+        await self._send_light_run_mode(mode, index, 0x00, sub_id)
+
     async def identify(self, on: bool = True, sub_id: Optional[int] = None) -> None:
         """Make this device announce itself physically, so you can tell which
         bulb or switch an entity actually is.

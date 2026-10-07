@@ -20,6 +20,7 @@ from cync_lan.const import (
     PRIVATE_FILE_MODE,
     YES_ANSWER,
 )
+from cync_lan.effects import SavedEffect, saved_effects_from_config
 from cync_lan.structs import EntityState, GlobalObject
 
 logger = logging.getLogger(CYNC_LOG_NAME)
@@ -371,6 +372,28 @@ async def parse_schedules(cfg_file: Path) -> Dict[int, dict]:
             schedules[schedule_id] = schedule
     logger.debug(f"{lp} found {len(schedules)} schedule(s) across all homes")
     return schedules
+
+
+async def parse_saved_effects(cfg_file: Path) -> Dict[int, List[SavedEffect]]:
+    """Read the "saved_effects" section of the exported Cync config file
+    (written by cloud_api.py's _parse_raw_export): the layouts and light
+    shows saved in the Cync app, per home. Homes without the section (an
+    export written before it existed) are left out, so callers fall back to
+    built-in effects only.
+
+    Returns {home_id: [SavedEffect, ...]}, home_id matching CyncDevice.home_id.
+    """
+    lp = "parse_saved_effects:"
+    raw_config = await asyncio.get_event_loop().run_in_executor(
+        None, _read_and_parse_yaml, cfg_file
+    )
+    saved: Dict[int, List[SavedEffect]] = {}
+    main_key = "account data" if "account data" in raw_config else "exported_homes"
+    for home_cfg in raw_config.get(main_key, {}).values():
+        if "saved_effects" in home_cfg and "id" in home_cfg:
+            saved[home_cfg["id"]] = saved_effects_from_config(home_cfg["saved_effects"])
+    logger.debug(f"{lp} found saved effects for {len(saved)} home(s)")
+    return saved
 
 
 def check_python_version():

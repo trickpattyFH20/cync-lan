@@ -1,10 +1,10 @@
 {
-  "lib_remote": "git@github.com:trickpattyFH20/cync-lan-lib.git",
+  "lib_remote": "",
   "ref": "feature/effects-parity",
-  "commit": "45bc02100a00d6b7a5dcd2858864cd530cba313d",
+  "commit": "466559839e96a7c7d4ae4ff7297952cb17df6f4d",
   "lib_version": "0.16.1",
-  "bundled_version": "0.16.1+tp.45bc021",
-  "release": "2.15.0-tp.3",
+  "bundled_version": "0.16.1+tp.4665598",
+  "release": "2.15.0-tp.4",
   "lib_requirements": [
     "pyyaml>=6.0.2",
     "pydantic>=2.0.0",

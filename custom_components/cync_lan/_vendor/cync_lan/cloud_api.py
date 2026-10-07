@@ -26,6 +26,7 @@ from cync_lan.const import (
     CYNC_LOG_NAME,
     PRIVATE_FILE_MODE,
 )
+from cync_lan.effects import saved_effects_from_properties, saved_effects_to_config
 from cync_lan.structs import ComputedTokenStruct, EntityState, GlobalObject
 
 logger = logging.getLogger(CYNC_LOG_NAME)
@@ -1016,6 +1017,14 @@ class CyncCloudAPI:
                     # when absent.
                     "enabled": bool(raw_schedule.get("state", True)),
                 }
+
+            # Layouts (multiColorSchemes) and light shows (lightShows) saved
+            # in the Cync app: names and device slots only, which is what the
+            # light-run-mode command plays. Captured on Cafe Lights, see
+            # docs/cafe_lights_findings.md. Read by parse_saved_effects().
+            new_home["saved_effects"] = saved_effects_to_config(
+                saved_effects_from_properties(raw_home["properties"])
+            )
 
         # END OF HOME PARSING LOOP
         # write raw exported config to file for debugging, only if export source is None
