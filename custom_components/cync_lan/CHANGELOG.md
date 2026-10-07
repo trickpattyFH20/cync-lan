@@ -9,6 +9,18 @@ Docker/MQTT add-on's own version scheme - all three are versioned and
 released separately, even though this integration depends on `cync-lan` to
 do the actual protocol work.
 
+### Unreleased (trickpattyFH20 fork)
+
+**Requires cync-lan with `cync_lan.effects` (fork branch `feature/effects-parity`).**
+
+**Effects saved in the Cync app.** Dynamic-effects lights list the layouts and light shows saved in the Cync app
+by name and play them by slot. The names come from the cloud export (`saved_effects` in `cync_mesh.yaml`) and
+refresh with it, without reloading the integration.
+
+**The current effect.** `effect` now follows the light's own status, so a show started from the app or Alexa shows
+up in Home Assistant; `off` means plain white or colour. An effect name the light does not offer is now an error
+instead of being ignored. `effect: off` stops a show.
+
 ### 2.15.0
 
 **Requires cync-lan 0.16.1.** Capture logs stop eating the disk, and two

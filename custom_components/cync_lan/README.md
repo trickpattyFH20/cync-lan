@@ -146,6 +146,11 @@ Supported entity types in this integration specifically:
 
 - **Light** - on/off, brightness, color temperature, RGB color, and effects,
   depending on what the specific device model supports.
+  On dynamic-effects lights (string lights, strips) the effect list also holds the layouts and light shows saved
+  in the Cync app, by name, after the next cloud export refresh (every 24 hours by default; lower "Export refresh
+  interval" to pick up new saves sooner). A saved name that clashes with another gets its kind and slot appended,
+  e.g. "Candle (show 12)". The light's `effect` attribute follows what the light reports it is showing, including
+  shows started from the Cync app or Alexa; `off` means plain white or colour.
 - **Light (group)** - one aggregate `light` entity per Cync device group
   ("Living Room", etc.) whose members are lights, opt-in via the "Create
   light group entities" configuration parameter above. Reads as on if any
