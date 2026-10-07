@@ -544,6 +544,52 @@ async def test_options_flow_applies_groups_without_reload(hass, mock_cloud_api):
     )
 
 
+async def test_options_flow_refresh_hands_saved_effects_to_the_lights(
+    hass, mock_cloud_api
+):
+    """Saving options with light groups on re-exports; the layouts/shows
+    saved in the Cync app must reach the lights then too, not wait for the
+    periodic refresh."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    mock_cloud_api.check_token = AsyncMock(return_value=True)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="user@example.com",
+        data={"account_username": "user@example.com", "account_password": "x"},
+        options={"local_port": 23779, "export_refresh_interval": 24},
+    )
+    entry.add_to_hass(hass)
+    entry.runtime_data = SimpleNamespace(groups=None, saved_effects={})
+
+    with patch("cync_lan.utils.parse_groups", new=AsyncMock(return_value={})), patch(
+        "custom_components.cync_lan.light.async_add_light_groups", new=AsyncMock()
+    ), patch(
+        "custom_components.cync_lan.switch.async_add_switch_groups", new=AsyncMock()
+    ), patch(
+        "custom_components.cync_lan._apply_saved_effects", new=AsyncMock()
+    ) as mock_apply:
+        result = await _start_general_settings(hass, entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {
+                "local_port": 23779,
+                "export_refresh_interval": 24,
+                "enable_light_groups": True,
+            },
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    mock_apply.assert_awaited_once()
+    hass_arg, entry_arg, path_arg = mock_apply.await_args.args
+    assert hass_arg is hass and entry_arg is entry
+    assert isinstance(path_arg, Path) and path_arg.name == "cync_mesh.yaml"
+
+
 async def test_options_flow_light_groups_noop_before_initial_setup(
     hass, mock_cloud_api
 ):
