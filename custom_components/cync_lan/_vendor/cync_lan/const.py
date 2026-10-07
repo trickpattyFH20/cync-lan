@@ -182,6 +182,11 @@ CYNC_CONFIG_FILE_PATH: str = f"{CYNC_CONFIG_DIR}/cync_mesh.yaml"
 CYNC_UUID_PATH: str = f"{CYNC_CONFIG_DIR}/uuid.txt"
 CYNC_CLOUD_AUTH_PATH: str = f"{CYNC_CONFIG_DIR}/.cloud_auth.enc.json"
 
+# Everything cync-lan writes (token cache, exported config, bridge UUID,
+# traffic captures) is for its own user only. These were 0o777.
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+
 CYNC_SSL_CERT: str = os.environ.get("CYNC_DEVICE_CERT", "/root/cync-lan/certs/cert.pem")
 CYNC_SSL_KEY: str = os.environ.get("CYNC_DEVICE_KEY", "/root/cync-lan/certs/key.pem")
 

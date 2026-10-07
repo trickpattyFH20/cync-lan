@@ -190,18 +190,25 @@ class Tasks:
     proxy_task: Optional[asyncio.Task] = None
     dev_conn_watcher: Optional[asyncio.Task] = None
     proxy_conn_watcher: Optional[asyncio.Task] = None
+    # The passthrough fallback claims control with send_a3(), which waits;
+    # tracked here so closing the session cancels it.
+    passthrough_fallback: Optional[asyncio.Task] = None
 
     def __iter__(self):
-        tasks = [self.receive, self.send, self.callback_cleanup, self.dev_conn_watcher]
+        tasks = [
+            self.receive,
+            self.send,
+            self.callback_cleanup,
+            self.dev_conn_watcher,
+            self.passthrough_fallback,
+        ]
         for task in tasks:
             if task is not None:
                 yield task
 
     def __len__(self):
-        tasks = [self.receive, self.send, self.callback_cleanup, self.dev_conn_watcher]
-        # remove any that are None
-        tasks = [task for task in tasks if task is not None]
-        return len(list(tasks))
+        # Not len(list(self)): list() asks __len__ for a size hint first.
+        return sum(1 for _ in self)
 
     async def cancel_all(self):
         """Cancels all active tasks and waits for them to finish."""
@@ -215,6 +222,7 @@ class Tasks:
         self.send = None
         self.callback_cleanup = None
         self.dev_conn_watcher = None
+        self.passthrough_fallback = None
 
 
 class ControlMessageCallback:

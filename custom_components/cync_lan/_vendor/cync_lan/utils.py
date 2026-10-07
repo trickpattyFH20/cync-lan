@@ -16,6 +16,8 @@ from cync_lan.const import (
     CYNC_LOG_NAME,
     CYNC_UUID_PATH,
     LOCAL_TZ,
+    PRIVATE_DIR_MODE,
+    PRIVATE_FILE_MODE,
     YES_ANSWER,
 )
 from cync_lan.structs import EntityState, GlobalObject
@@ -385,7 +387,7 @@ def check_for_uuid():
     lp = "check_uuid:"
     # create dir for cync_mesh.yaml and variable data if it does not exist
     persistent_dir = Path(CYNC_CONFIG_DIR).expanduser().resolve()
-    os.chmod(persistent_dir, 0o777)
+    os.chmod(persistent_dir, PRIVATE_DIR_MODE)
     if not persistent_dir.exists():
         try:
             persistent_dir.mkdir(parents=True, exist_ok=True)
@@ -434,7 +436,7 @@ def check_for_uuid():
         g.uuid = uuid.uuid4()
         with open(uuid_file, "w") as f:
             f.write(str(g.uuid))
-            os.chmod(uuid_file, 0o777)
+            os.chmod(uuid_file, PRIVATE_FILE_MODE)
             logger.info(f"{lp} UUID written to disk: {uuid_file.as_posix()}")
 
 

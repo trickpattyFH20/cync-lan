@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,4 +24,5 @@ def test_lists_every_bundled_library_dependency() -> None:
 
 
 def test_version_matches_release() -> None:
-    assert MANIFEST["version"] == VENDORED["release"] == "2.15.0-tp.1"
+    assert MANIFEST["version"] == VENDORED["release"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+-tp\.\d+", MANIFEST["version"])

@@ -24,6 +24,7 @@ from cync_lan.const import (
     CYNC_API_BASE,
     CYNC_CORP_ID,
     CYNC_LOG_NAME,
+    PRIVATE_FILE_MODE,
 )
 from cync_lan.structs import ComputedTokenStruct, EntityState, GlobalObject
 
@@ -36,7 +37,7 @@ def _write_yaml_and_chmod(path: Path, data: dict) -> None:
     executor, not called directly from the event loop."""
     with open(path, "w") as f:
         f.write(yaml.dump(data))
-    os.chmod(path, 0o777)
+    os.chmod(path, PRIVATE_FILE_MODE)
 
 
 # Cync's own 4-slot motion-sensor schedule model (confirmed via the decompiled
@@ -460,7 +461,7 @@ class CyncCloudAPI:
 
             def _write() -> None:
                 Path(self.auth_cache_file).write_bytes(encrypted_data)
-                os.chmod(self.auth_cache_file, 0o777)
+                os.chmod(self.auth_cache_file, PRIVATE_FILE_MODE)
 
             # async-dependency: same blocking-call fix as read_token_cache above.
             await asyncio.get_running_loop().run_in_executor(None, _write)

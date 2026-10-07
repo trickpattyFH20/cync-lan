@@ -33,6 +33,8 @@ from cync_lan.const import (
     DATA_BOUNDARY,
     FACTORY_EFFECTS_BYTES,
     LIGHT_RUN_MODE_EFFECTS,
+    PRIVATE_DIR_MODE,
+    PRIVATE_FILE_MODE,
     STREAM_CHUNK_SIZE,
     TCP_BLACKHOLE_DELAY,
 )
@@ -3724,7 +3726,7 @@ class CyncTCPSession:
         # abandons the rest of its own teardown. By the time the new task
         # runs, this one is done and stop_proxy's `not .done()` guards skip it.
         if self.passthrough:
-            asyncio.create_task(
+            self.tasks.passthrough_fallback = asyncio.create_task(
                 self._fall_back_to_local_control(),
                 name=f"passthrough_fallback-{self.ip_address}",
             )
@@ -3767,6 +3769,18 @@ class CyncTCPSession:
         # Dropped so a later enable_passthrough() opens a fresh capture log
         # rather than reusing a handler for a relay that no longer exists.
         self.mitm_logger = None
+        # Acks alone do not make the session controllable again.
+        # broadcast_control_command writes only to sessions that are relaying
+        # or ready_to_control, and ready_to_control is set by send_a3() during
+        # our own handshake - which never ran here, because the cloud answered
+        # the device's 0x23. Claim control now, the way a local handshake
+        # would. The 0x23's queue_id is recorded even while relaying; without
+        # it the device has not logged in yet, and its 0x23 will run the full
+        # local handshake when it arrives. A closed session is skipped: close()
+        # leaves the relay task running, so its relay can end after the device
+        # is gone, and there is nothing left to control.
+        if len(self.queue_id) == 4 and not self.is_closed():
+            await self.send_a3()
 
     def _setup_mitm_logger(self):
         """Initializes a rotating file logger for this specific connection."""
@@ -3810,7 +3824,7 @@ class CyncTCPSession:
         log_dir = Path(CYNC_MITM_LOG_DIR)
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(log_dir, 0o777)
+            os.chmod(log_dir, PRIVATE_DIR_MODE)
         except OSError as exc:
             logger.warning(
                 f"{lp} cannot write capture logs to {log_dir} ({exc}); "
@@ -3847,7 +3861,7 @@ class CyncTCPSession:
             stdout_handler.setFormatter(formatter)
             self.mitm_logger.addHandler(stdout_handler)
         with contextlib.suppress(OSError):
-            os.chmod(log_file, 0o777)
+            os.chmod(log_file, PRIVATE_FILE_MODE)
         logger.debug(
             f"Created a MITM logger for node: '{self.name}' (ID: {node_id}) -> {log_file}"
         )
